@@ -1,27 +1,44 @@
 """
 Notification Router – email and push notifications for key platform events.
 Called directly by other microservices (no JWT required for internal calls).
-Add an internal API key check for production security.
 """
 
+import logging
 from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Optional
 import httpx
-import firebase_admin
-from firebase_admin import credentials, messaging
 
 from app.core.config import settings
 from app.core.database import supabase, supabase_auth
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
-# Firebase Admin SDK init (only once)
+# ── Firebase Admin SDK init (graceful – push is optional) ─────────────────────
+
+_firebase_enabled = False
+
 try:
-    firebase_admin.get_app()
-except ValueError:
-    cred = credentials.Certificate(settings.FIREBASE_CREDENTIALS_PATH)
-    firebase_admin.initialize_app(cred)
+    import firebase_admin
+    from firebase_admin import credentials, messaging
+
+    try:
+        firebase_admin.get_app()
+        _firebase_enabled = True
+        logger.info("Firebase: already initialised")
+    except ValueError:
+        try:
+            cred = credentials.Certificate(settings.FIREBASE_CREDENTIALS_PATH)
+            firebase_admin.initialize_app(cred)
+            _firebase_enabled = True
+            logger.info("Firebase: initialised successfully")
+        except Exception as e:
+            logger.warning(
+                f"Firebase init failed (push notifications disabled): {e}"
+            )
+except ImportError:
+    logger.warning("firebase-admin not installed – push notifications disabled")
 
 
 # ── Schemas ──────────────────────────────────────────────
@@ -59,21 +76,31 @@ EVENT_MESSAGES = {
 
 async def send_email_via_supabase(to_email: str, subject: str, body: str):
     """Send transactional email via Supabase Edge Function or SMTP."""
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            f"{settings.SUPABASE_URL}/functions/v1/send-email",
-            headers={"Authorization": f"Bearer {settings.SUPABASE_SERVICE_KEY}"},
-            json={"to": to_email, "subject": subject, "body": body},
-            timeout=10,
-        )
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{settings.SUPABASE_URL}/functions/v1/send-email",
+                headers={"Authorization": f"Bearer {settings.SUPABASE_SERVICE_KEY}"},
+                json={"to": to_email, "subject": subject, "body": body},
+                timeout=10,
+            )
+    except Exception as e:
+        logger.warning(f"Email send failed (non-fatal): {e}")
 
 
 def send_push_notification(fcm_token: str, title: str, body: str):
-    message = messaging.Message(
-        notification=messaging.Notification(title=title, body=body),
-        token=fcm_token,
-    )
-    messaging.send(message)
+    """Send FCM push notification. No-op if Firebase is not configured."""
+    if not _firebase_enabled:
+        logger.warning("Push skipped – Firebase not configured")
+        return
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            token=fcm_token,
+        )
+        messaging.send(message)
+    except Exception as e:
+        logger.warning(f"Push send failed (non-fatal): {e}")
 
 
 # ── Endpoints ────────────────────────────────────────────
@@ -94,12 +121,15 @@ async def send_email_notification(payload: EmailRequest):
     await send_email_via_supabase(email, subject_template, body)
 
     # Log notification
-    supabase.table("notification_logs").insert({
-        "user_id": payload.user_id,
-        "channel": "email",
-        "event": payload.event,
-        "status": "sent",
-    }).execute()
+    try:
+        supabase.table("notification_logs").insert({
+            "user_id": payload.user_id,
+            "channel": "email",
+            "event": payload.event,
+            "status": "sent",
+        }).execute()
+    except Exception as e:
+        logger.warning(f"Notification log insert failed: {e}")
 
     return {"message": "Email sent"}
 
@@ -109,29 +139,39 @@ async def send_push(payload: PushRequest):
     fcm_token = payload.fcm_token
     if not fcm_token:
         # Look up FCM token from DB
-        result = supabase.table("notifications").select("fcm_token").eq("user_id", payload.user_id).execute()
-        if result.data:
-            fcm_token = result.data[0].get("fcm_token")
+        try:
+            result = supabase.table("notifications").select("fcm_token").eq("user_id", payload.user_id).execute()
+            if result.data:
+                fcm_token = result.data[0].get("fcm_token")
+        except Exception:
+            pass
 
     if fcm_token:
         send_push_notification(fcm_token, payload.title, payload.body)
 
-    supabase.table("notification_logs").insert({
-        "user_id": payload.user_id,
-        "channel": "push",
-        "event": "manual_push",
-        "status": "sent" if fcm_token else "no_token",
-    }).execute()
+    try:
+        supabase.table("notification_logs").insert({
+            "user_id": payload.user_id,
+            "channel": "push",
+            "event": "manual_push",
+            "status": "sent" if (fcm_token and _firebase_enabled) else "no_token",
+        }).execute()
+    except Exception as e:
+        logger.warning(f"Notification log insert failed: {e}")
 
     return {"message": "Push notification processed"}
 
 
 @router.post("/reminder")
 async def schedule_reminder(payload: ReminderRequest):
-    supabase.table("notifications").insert({
-        "user_id": payload.user_id,
-        "reminder_type": payload.reminder_type,
-        "scheduled_at": payload.scheduled_at,
-        "status": "pending",
-    }).execute()
+    try:
+        supabase.table("notifications").insert({
+            "user_id": payload.user_id,
+            "reminder_type": payload.reminder_type,
+            "scheduled_at": payload.scheduled_at,
+            "status": "pending",
+        }).execute()
+    except Exception as e:
+        logger.warning(f"Reminder insert failed: {e}")
+        return {"message": "Reminder scheduling failed", "detail": str(e)}
     return {"message": "Reminder scheduled"}
