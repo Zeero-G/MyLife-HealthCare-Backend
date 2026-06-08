@@ -2,14 +2,17 @@
 Records Router – CRUD + QR sharing for medical records.
 All routes are protected by JWT (get_current_user dependency).
 
-IMPORTANT: Specific routes (/share-qr, /family/{id}, /upload) MUST come
-before the generic /{record_id} route to avoid FastAPI matching them as record IDs.
+IMPORTANT: Specific routes (/share-qr, /family/{id}, /upload, /presign-upload,
+/confirm-upload) MUST come before the generic /{record_id} route to avoid
+FastAPI matching them as record IDs.
 """
 
 import uuid
 from datetime import datetime, timedelta
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, status
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, status, Query
 import httpx
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
 
 from app.core.config import settings
 from app.core.security import get_current_user
@@ -20,6 +23,27 @@ from app.schemas.records_schemas import (
 )
 
 router = APIRouter()
+
+
+def _s3_client():
+    """Create a boto3 S3 client using credentials from settings."""
+    if not settings.AWS_ACCESS_KEY_ID or not settings.S3_BUCKET:
+        raise HTTPException(
+            status_code=503,
+            detail="S3 is not configured on the server. Set AWS_ACCESS_KEY_ID and S3_BUCKET."
+        )
+    return boto3.client(
+        "s3",
+        region_name=settings.AWS_REGION,
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+    )
+
+
+def _s3_public_url(key: str) -> str:
+    """Return the public HTTPS URL for an S3 object."""
+    return f"https://{settings.S3_BUCKET}.s3.{settings.AWS_REGION}.amazonaws.com/{key}"
+
 
 
 # ── GET /records/ ─────────────────────────────────────────────
@@ -59,18 +83,95 @@ async def share_qr(payload: ShareQRRequest, current_user: dict = Depends(get_cur
     return ShareQRResponse(qr_token=token, share_url=share_url, expires_at=expires_at.isoformat())
 
 
+# ── GET /records/presign-upload ──────────────────────────── (BEFORE /{record_id})
+@router.get("/presign-upload")
+async def presign_upload(
+    filename: str = Query(..., description="Original filename e.g. report.pdf"),
+    content_type: str = Query("application/octet-stream", description="MIME type of the file"),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Returns a presigned S3 PUT URL so the frontend can upload a file directly
+    to S3 without going through the backend.  Also returns the final public URL
+    that should be passed to /confirm-upload after the PUT succeeds.
+    """
+    s3 = _s3_client()
+    key = f"{current_user['sub']}/{uuid.uuid4()}_{filename}"
+    try:
+        presigned_url = s3.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": settings.S3_BUCKET,
+                "Key": key,
+                "ContentType": content_type,
+            },
+            ExpiresIn=settings.S3_PRESIGN_EXPIRY,
+        )
+    except (NoCredentialsError, ClientError) as e:
+        raise HTTPException(status_code=500, detail=f"Could not generate presigned URL: {e}")
+
+    return {
+        "presigned_url": presigned_url,
+        "public_url": _s3_public_url(key),
+        "key": key,
+        "expires_in": settings.S3_PRESIGN_EXPIRY,
+    }
+
+
+# ── POST /records/confirm-upload ─────────────────────────── (BEFORE /{record_id})
+@router.post("/confirm-upload")
+async def confirm_upload(
+    payload: dict,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Called after the frontend has successfully PUT the file to S3.
+    Triggers asynchronous AI extraction and returns the public S3 URL.
+
+    Body: { "file_url": "https://…", "filename": "report.pdf" }
+    """
+    file_url: str = payload.get("file_url", "")
+    if not file_url:
+        raise HTTPException(status_code=422, detail="file_url is required")
+
+    # Trigger AI service asynchronously (non-blocking)
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{settings.AI_SERVICE_URL}/ai/process",
+                json={"user_id": current_user["sub"], "file_url": file_url},
+                timeout=10,
+            )
+    except Exception:
+        pass  # AI failure must not block the upload confirmation
+
+    return {
+        "file_url": file_url,
+        "message": "Upload confirmed. AI extraction queued.",
+    }
+
+
 # ── POST /records/upload ──────────────────────────────────── (BEFORE /{record_id})
 @router.post("/upload")
 async def upload_document(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
-    """Upload a PDF/image to Supabase Storage and trigger AI processing."""
+    """Legacy: stream file through backend → S3. Prefer presign-upload for large files."""
+    s3 = _s3_client()
     file_bytes = await file.read()
-    file_path = f"{current_user['sub']}/{uuid.uuid4()}_{file.filename}"
+    key = f"{current_user['sub']}/{uuid.uuid4()}_{file.filename}"
 
-    # Upload to Supabase Storage
-    supabase.storage.from_(settings.STORAGE_BUCKET).upload(file_path, file_bytes)
-    public_url = supabase.storage.from_(settings.STORAGE_BUCKET).get_public_url(file_path)
+    try:
+        s3.put_object(
+            Bucket=settings.S3_BUCKET,
+            Key=key,
+            Body=file_bytes,
+            ContentType=file.content_type or "application/octet-stream",
+        )
+    except (NoCredentialsError, ClientError) as e:
+        raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
 
-    # Trigger AI service for extraction
+    public_url = _s3_public_url(key)
+
+    # Trigger AI extraction (non-blocking)
     try:
         async with httpx.AsyncClient() as client:
             await client.post(
@@ -79,9 +180,9 @@ async def upload_document(file: UploadFile = File(...), current_user: dict = Dep
                 timeout=10,
             )
     except Exception:
-        pass   # Non-blocking
+        pass
 
-    return {"file_url": public_url, "message": "File uploaded. AI extraction queued."}
+    return {"file_url": public_url, "message": "File uploaded to S3. AI extraction queued."}
 
 
 # ── GET /records/family/{patient_id} ─────────────────────── (BEFORE /{record_id})

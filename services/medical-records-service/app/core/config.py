@@ -22,8 +22,16 @@ class Settings(BaseSettings):
     NOTIFICATION_SERVICE_URL: str = os.getenv("NOTIFICATION_SERVICE_URL", "http://localhost:8005")
     AI_SERVICE_URL: str = os.getenv("AI_SERVICE_URL", "http://localhost:8004")
 
-    # Supabase storage bucket
+    # Supabase storage bucket (kept for fallback/QR features)
     STORAGE_BUCKET: str = "medical-docs"
+
+    # AWS S3 configuration
+    AWS_ACCESS_KEY_ID: str = os.getenv("AWS_ACCESS_KEY_ID", "")
+    AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    AWS_REGION: str = os.getenv("AWS_REGION", "ap-south-1")
+    S3_BUCKET: str = os.getenv("S3_BUCKET", "")
+    # How long (seconds) a presigned PUT URL is valid
+    S3_PRESIGN_EXPIRY: int = int(os.getenv("S3_PRESIGN_EXPIRY", "900"))
 
     class Config:
         env_file = ".env"
